@@ -149,8 +149,8 @@ class TelegramBot:
             else:
                 reply = f"🚀 Starting pipeline for: <b>{topic}</b>\nCheck back in ~2 minutes..."
                 await self.send_message(reply, chat_id)
-                # Run pipeline in background
-                asyncio.create_task(self._run_and_notify(topic, chat_id))
+                # Run pipeline directly (not as background task)
+                await self._run_and_notify(topic, chat_id)
                 return reply
 
         elif text == "/help":
