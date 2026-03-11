@@ -1,6 +1,3 @@
-
-Copy
-
 """
 core/image_generator.py
 Zero-cost image generation with professional fallback chain.
