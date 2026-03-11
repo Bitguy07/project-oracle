@@ -32,7 +32,7 @@ POLLINATIONS_PARAMS = {
 }
 
 # Hugging Face fallback
-HF_API_URL = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell"
+HF_API_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
 
 # Dimensions per post type
 DIMENSIONS = {
@@ -93,7 +93,12 @@ class ImageGenerator:
         log.debug(f"Pollinations URL: {url[:120]}...")
 
         async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
-            r = await client.get(url)
+            for attempt in range(3):
+                r = await client.get(url)
+                if r.status_code == 200:
+                    break
+                log.warning(f"Pollinations attempt {attempt+1} failed: HTTP {r.status_code}")
+                await asyncio.sleep(5)
             if r.status_code != 200:
                 raise RuntimeError(f"HTTP {r.status_code}")
             if len(r.content) < 5000:
