@@ -80,7 +80,7 @@ class InstagramPublisher:
         file_size_mb = len(video_bytes) / (1024 * 1024)
         log.info(f"Uploading {file_size_mb:.1f}MB video to temp host...")
 
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
             r = await client.post(
                 "https://file.io/?expires=1d",
                 files={"file": (video_path.name, video_bytes, "video/mp4")},
