@@ -45,7 +45,7 @@ class StateManager:
 
     def __init__(self):
         self.gist_id = os.environ.get("GIST_ID")
-        self.github_token = os.environ.get("GITHUB_TOKEN")
+        self.github_token = os.environ.get("GIST_TOKEN") or os.environ.get("GITHUB_TOKEN")
         self.local_path = Path("config.json")
         self._state: dict = self._load()
         self._reset_quota_if_new_day()

@@ -12,7 +12,8 @@ import re
 import textwrap
 from typing import Optional
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 log = logging.getLogger("oracle.intelligence")
 
@@ -66,11 +67,7 @@ class IntelligenceEngine:
         api_key = os.environ.get("GEMINI_API_KEY")
         if not api_key:
             raise EnvironmentError("GEMINI_API_KEY environment variable not set.")
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel(
-            MODEL_NAME,
-            generation_config=GENERATION_CONFIG,
-        )
+        self.client = genai.Client(api_key=api_key)
 
     async def generate_content(self, topic: str, post_type: str = "reel") -> dict:
         """
@@ -81,7 +78,14 @@ class IntelligenceEngine:
 
         log.info(f"Calling Gemini for topic='{topic}'")
         response = await asyncio.to_thread(
-            self.model.generate_content, prompt
+            self.client.models.generate_content,
+            model=MODEL_NAME,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.9,
+                top_p=0.95,
+                max_output_tokens=1024,
+            )
         )
         raw = response.text.strip()
 

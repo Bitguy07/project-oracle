@@ -113,6 +113,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
         run: python main.py cron
 
       # ── Single topic mode (manual dispatch) ───────────────────────────────
@@ -131,6 +132,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
         run: |
           python main.py single "${{ github.event.inputs.topic }}" "${{ github.event.inputs.post_type }}"
 
@@ -147,6 +149,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           TELEGRAM_UPDATE: ${{ toJson(github.event.client_payload) }}
         run: python telegram_webhook_handler.py
 
@@ -156,6 +159,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
         run: |
           python -c "
           import asyncio, os, sys
