@@ -74,69 +74,35 @@ class InstagramPublisher:
 
     async def _upload_to_temp_host(self, video_path: Path) -> str:
         """
-        Upload video as a GitHub Release asset — always works from GitHub Actions.
-        Uses the same GIST_TOKEN we already have.
-        Returns public download URL, deletes release after Instagram fetches it.
+        Upload to transfer.sh — returns direct CDN URL, no redirects.
+        Instagram can fetch it directly.
         """
-        import base64
-        import time
+        video_bytes = video_path.read_bytes()
+        file_size_mb = len(video_bytes) / (1024 * 1024)
+        log.info(f"Uploading {file_size_mb:.1f}MB to transfer.sh...")
 
-        github_token = os.environ.get("GIST_TOKEN") or os.environ.get("GITHUB_TOKEN")
-        gh_repo = "Bitguy07/Project-Oracle"
-        tag = f"temp-video-{int(time.time())}"
-
-        headers = {
-            "Authorization": f"token {github_token}",
-            "Accept": "application/vnd.github.v3+json",
-            "User-Agent": "ProjectOracle/1.0",
-        }
-
-        async with httpx.AsyncClient(timeout=60.0) as client:
-
-            # Step 1: Create a temporary release
-            r = await client.post(
-                f"https://api.github.com/repos/{gh_repo}/releases",
-                headers=headers,
-                json={
-                    "tag_name": tag,
-                    "name": f"Temp video {tag}",
-                    "body": "Temporary video for Instagram upload. Will be deleted.",
-                    "draft": False,
-                    "prerelease": True,
-                },
-            )
-            release = r.json()
-            if "id" not in release:
-                raise RuntimeError(f"Failed to create release: {release}")
-
-            release_id = release["id"]
-            upload_url = release["upload_url"].replace("{?name,label}", "")
-            log.info(f"Created temp release: {release_id}")
-
-            # Step 2: Upload video as release asset
-            video_bytes = video_path.read_bytes()
-            r = await client.post(
-                f"{upload_url}?name={video_path.name}",
-                headers={
-                    **headers,
-                    "Content-Type": "video/mp4",
-                },
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            r = await client.put(
+                f"https://transfer.sh/{video_path.name}",
                 content=video_bytes,
-                timeout=120.0,
+                headers={
+                    "Content-Type": "video/mp4",
+                    "Max-Days": "1",
+                },
             )
-            asset = r.json()
-            if "browser_download_url" not in asset:
-                raise RuntimeError(f"Asset upload failed: {asset}")
 
-            video_url = asset["browser_download_url"]
-            log.info(f"Video hosted at: {video_url}")
+        if r.status_code != 200:
+            raise RuntimeError(
+                f"transfer.sh failed: HTTP {r.status_code} — {r.text[:200]}"
+            )
 
-            # Store release_id for cleanup after publishing
-            self._temp_release_id = release_id
-            self._gh_repo = gh_repo
-            self._gh_headers = headers
+        url = r.text.strip()
+        log.info(f"Video URL: {url}")
 
-            return video_url
+        if not url.startswith("https://"):
+            raise RuntimeError(f"Invalid URL: {url}")
+
+        return url
 
     async def _cleanup_temp_release(self):
         """Delete the temporary GitHub release after Instagram has fetched the video."""
@@ -184,7 +150,7 @@ class InstagramPublisher:
         """Poll container status until FINISHED."""
         endpoint = f"{GRAPH_API_BASE}/{container_id}"
         params = {
-            "fields": "status_code,status,error_type,error_message",
+            "fields": "status_code,status",
             "access_token": self.access_token,
         }
 
