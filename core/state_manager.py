@@ -2,6 +2,10 @@
 core/state_manager.py
 Persistence layer using GitHub Gist as a zero-cost key-value store.
 Falls back to local config.json for development/testing.
+
+New in this version:
+  - review_mode: "auto" | "review"
+  - pending_posts: videos waiting for /done or /no approval
 """
 
 import json
@@ -17,32 +21,26 @@ import requests
 
 log = logging.getLogger("oracle.state")
 
-# ── Schema ────────────────────────────────────────────────────────────────────
 DEFAULT_STATE = {
     "quota": {
-        "gemini_daily_limit": 1500,        # Gemini Flash free tier: 1500 req/day
+        "gemini_daily_limit": 1500,
         "gemini_used_today": 0,
         "images_generated_today": 0,
         "image_daily_limit": 50,
-        "reset_date": "",                  # ISO date string, e.g. "2024-01-15"
+        "reset_date": "",
     },
-    "posts": [],                           # Last 50 posts [{topic, caption, ig_id, ts}]
-    "topic_queue": [],                     # [{id, topic, type, added_at}]
+    "posts": [],
+    "topic_queue": [],
+    "pending_posts": [],        # Videos awaiting /done or /no review
+    "review_mode": "auto",      # "auto" or "review"
     "last_updated": "",
 }
 
 MAX_POSTS_HISTORY = 50
-RECENT_TOPIC_HOURS = 24                    # Don't re-post same topic within 24h
+RECENT_TOPIC_HOURS = 24
 
 
 class StateManager:
-    """
-    Thin wrapper around a JSON state object.
-    Persistence backends (in priority order):
-      1. GitHub Gist  (GIST_ID + GITHUB_TOKEN env vars set)
-      2. Local config.json  (fallback / dev mode)
-    """
-
     def __init__(self):
         self.gist_id = os.environ.get("GIST_ID")
         self.github_token = os.environ.get("GIST_TOKEN") or os.environ.get("GITHUB_TOKEN")
@@ -50,16 +48,16 @@ class StateManager:
         self._state: dict = self._load()
         self._reset_quota_if_new_day()
 
-    # ── Public API ─────────────────────────────────────────────────────────────
+    # ── Quota ──────────────────────────────────────────────────────────────────
 
     def has_quota(self) -> bool:
         q = self._state["quota"]
-        gemini_ok = q["gemini_used_today"] < q["gemini_daily_limit"]
-        image_ok = q["images_generated_today"] < q["image_daily_limit"]
-        return gemini_ok and image_ok
+        return (
+            q["gemini_used_today"] < q["gemini_daily_limit"]
+            and q["images_generated_today"] < q["image_daily_limit"]
+        )
 
     def decrement_quota(self, gemini_calls: int = 3, images: int = 1):
-        """Called after each successful post (1 post ≈ 3 Gemini calls + 1 image)."""
         q = self._state["quota"]
         q["gemini_used_today"] += gemini_calls
         q["images_generated_today"] += images
@@ -83,9 +81,10 @@ class StateManager:
             "date": datetime.now(timezone.utc).isoformat(),
         }
         self._state["posts"].insert(0, post)
-        # Trim history
         self._state["posts"] = self._state["posts"][:MAX_POSTS_HISTORY]
         self._save()
+
+    # ── Queue ──────────────────────────────────────────────────────────────────
 
     def get_topic_queue(self) -> list:
         return list(self._state["topic_queue"])
@@ -99,7 +98,6 @@ class StateManager:
             "added_at": datetime.now(timezone.utc).isoformat(),
         })
         self._save()
-        log.info(f"Added to queue: [{item_id}] {topic} ({post_type})")
         return item_id
 
     def remove_from_queue(self, item_id: str):
@@ -107,6 +105,65 @@ class StateManager:
             i for i in self._state["topic_queue"] if i["id"] != item_id
         ]
         self._save()
+
+    # ── Review Mode ────────────────────────────────────────────────────────────
+
+    def get_review_mode(self) -> str:
+        """Returns 'auto' or 'review'."""
+        return self._state.get("review_mode", "auto")
+
+    def set_review_mode(self, mode: str):
+        """Set to 'auto' or 'review'."""
+        if mode not in ("auto", "review"):
+            raise ValueError(f"Invalid mode: {mode}. Use 'auto' or 'review'.")
+        self._state["review_mode"] = mode
+        self._save()
+        log.info(f"Review mode set to: {mode}")
+
+    # ── Pending Posts (Review Queue) ───────────────────────────────────────────
+
+    def save_pending_post(
+        self,
+        topic: str,
+        post_type: str,
+        video_path: str,
+        caption: str,
+    ) -> str:
+        """Save a rendered video awaiting human review. Returns pending_id."""
+        pending_id = str(uuid.uuid4())[:8]
+        self._state.setdefault("pending_posts", []).append({
+            "id": pending_id,
+            "topic": topic,
+            "post_type": post_type,
+            "video_path": video_path,
+            "caption": caption,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "ts": time.time(),
+        })
+        self._save()
+        log.info(f"Saved pending post: {pending_id} ({topic})")
+        return pending_id
+
+    def get_pending_post(self, pending_id: str) -> Optional[dict]:
+        """Retrieve a pending post by ID."""
+        for p in self._state.get("pending_posts", []):
+            if p["id"] == pending_id:
+                return p
+        return None
+
+    def get_all_pending_posts(self) -> list:
+        return list(self._state.get("pending_posts", []))
+
+    def remove_pending_post(self, pending_id: str):
+        """Remove a pending post (after /done or /no)."""
+        self._state["pending_posts"] = [
+            p for p in self._state.get("pending_posts", [])
+            if p["id"] != pending_id
+        ]
+        self._save()
+        log.info(f"Removed pending post: {pending_id}")
+
+    # ── Stats ──────────────────────────────────────────────────────────────────
 
     def get_stats(self) -> dict:
         q = self._state["quota"]
@@ -116,9 +173,11 @@ class StateManager:
             "images_used": q["images_generated_today"],
             "image_limit": q["image_daily_limit"],
             "queue_length": len(self._state["topic_queue"]),
+            "pending_count": len(self._state.get("pending_posts", [])),
             "total_posts": len(self._state["posts"]),
             "last_post": self._state["posts"][0] if self._state["posts"] else None,
             "reset_date": q["reset_date"],
+            "review_mode": self.get_review_mode(),
         }
 
     # ── Persistence ────────────────────────────────────────────────────────────
@@ -128,18 +187,17 @@ class StateManager:
             try:
                 return self._load_from_gist()
             except Exception as e:
-                log.warning(f"Gist load failed ({e}), falling back to local file.")
+                log.warning(f"Gist load failed ({e}), falling back to local.")
 
         if self.local_path.exists():
             with open(self.local_path) as f:
                 data = json.load(f)
-                # Merge missing keys from DEFAULT_STATE
                 for key, val in DEFAULT_STATE.items():
                     data.setdefault(key, val)
                 return data
 
-        log.info("No existing state found. Initialising with defaults.")
-        return json.loads(json.dumps(DEFAULT_STATE))  # deep copy
+        log.info("No existing state. Initialising with defaults.")
+        return json.loads(json.dumps(DEFAULT_STATE))
 
     def _save(self):
         self._state["last_updated"] = datetime.now(timezone.utc).isoformat()
@@ -149,7 +207,6 @@ class StateManager:
                 return
             except Exception as e:
                 log.warning(f"Gist save failed ({e}), saving locally.")
-
         with open(self.local_path, "w") as f:
             json.dump(self._state, f, indent=2)
 
@@ -162,11 +219,9 @@ class StateManager:
         r = requests.get(url, headers=headers, timeout=10)
         r.raise_for_status()
         files = r.json()["files"]
-        # Find our state file (first .json file in the gist)
         for fname, fdata in files.items():
             if fname.endswith(".json"):
-                content = fdata.get("content", "{}")
-                return json.loads(content)
+                return json.loads(fdata.get("content", "{}"))
         raise ValueError("No JSON file found in Gist")
 
     def _save_to_gist(self):
@@ -185,8 +240,6 @@ class StateManager:
         }
         r = requests.patch(url, headers=headers, json=payload, timeout=10)
         r.raise_for_status()
-
-    # ── Quota Reset ────────────────────────────────────────────────────────────
 
     def _reset_quota_if_new_day(self):
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
