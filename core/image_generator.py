@@ -1,6 +1,3 @@
-
-Copy
-
 """
 core/image_generator.py
 Image generation using Gemini 2.5 Flash Image API.
