@@ -1,121 +1,114 @@
+
+Copy
+
 """
 core/image_generator.py
-Zero-cost image generation with professional fallback chain.
-
-Chain (in order):
-  1. Pollinations.ai — reduced resolution (768px), short prompt, no model specified
-  2. Pollinations.ai — retry with different seed
-  3. Pollinations.ai — third attempt
-  4. Local gradient background (NEVER fails — pure FFmpeg)
+Image generation using Gemini 2.5 Flash Image API.
+ 
+Model: gemini-2.5-flash-image
+Free tier: 500 images/day — uses your existing GEMINI_API_KEY, no new signup.
+Aspect ratio: 9:16 for reels, 4:5 for feed.
+Falls back to local gradient if API fails.
 """
-
+ 
 import asyncio
+import base64
 import hashlib
 import logging
 import os
-import random
 import subprocess
-import urllib.parse
 from pathlib import Path
-
-import httpx
-
+ 
+from google import genai
+from google.genai import types
+ 
 log = logging.getLogger("oracle.image")
-
+ 
 ASSETS_DIR = Path("assets/images")
 ASSETS_DIR.mkdir(parents=True, exist_ok=True)
-
-# Dimensions per post type
+ 
 DIMENSIONS = {
     "reel": (1080, 1920),
     "feed": (1080, 1350),
 }
-
-# Reduced dimensions for Pollinations (avoids 500 errors on high-res)
-POLLINATIONS_DIMENSIONS = {
-    "reel": (768, 1344),
-    "feed": (768, 960),
+ 
+ASPECT_RATIOS = {
+    "reel": "9:16",
+    "feed": "4:5",
 }
-
-
+ 
+ 
 class ImageGenerator:
     def __init__(self):
-        self.hf_token = os.environ.get("HF_TOKEN")
-
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise EnvironmentError("GEMINI_API_KEY not set.")
+        self.client = genai.Client(api_key=api_key)
+ 
     async def generate(self, prompt: str, post_type: str = "reel") -> Path:
-        """
-        Generate image with fallback chain.
-        Never raises — worst case returns local gradient background.
-        """
         width, height = DIMENSIONS.get(post_type, (1080, 1920))
-        poll_w, poll_h = POLLINATIONS_DIMENSIONS.get(post_type, (768, 1344))
-
+        aspect_ratio = ASPECT_RATIOS.get(post_type, "9:16")
+ 
         slug = hashlib.md5(f"{prompt}{post_type}".encode()).hexdigest()[:12]
         output_path = ASSETS_DIR / f"{slug}.png"
-
+ 
         if output_path.exists():
             log.info(f"Image cache hit: {output_path}")
             return output_path
-
-        # Shorten prompt to max 80 chars for URL safety
-        short_prompt = self._shorten_prompt(prompt, max_chars=80)
-
-        # ── Try Pollinations 3 times with different seeds ──────────────────
-        for attempt in range(3):
-            try:
-                path = await self._pollinations(
-                    short_prompt, poll_w, poll_h, output_path
-                )
-                log.info(f"Pollinations succeeded on attempt {attempt+1}: {path}")
-                return path
-            except Exception as e:
-                log.warning(f"Pollinations attempt {attempt+1} failed: {e}")
-                await asyncio.sleep(3)
-
-        # ── All APIs failed → local gradient (never fails) ─────────────────
-        log.warning("All image APIs failed. Generating local gradient background.")
+ 
+        # ── Try Gemini 2.5 Flash Image ─────────────────────────────────────
+        try:
+            path = await self._gemini_image(prompt, aspect_ratio, output_path)
+            log.info(f"Gemini image succeeded: {path}")
+            return path
+        except Exception as e:
+            log.warning(f"Gemini image failed: {e}")
+ 
+        # ── Fallback: local gradient ───────────────────────────────────────
+        log.warning("Gemini image failed. Generating local gradient background.")
         return self._generate_gradient(width, height, output_path, prompt)
-
-    def _shorten_prompt(self, prompt: str, max_chars: int = 80) -> str:
-        """Shorten prompt to avoid Pollinations URL length issues."""
-        if len(prompt) <= max_chars:
-            return prompt.strip()
-        return prompt[:max_chars].rsplit(" ", 1)[0].strip()
-
-    async def _pollinations(
+ 
+    async def _gemini_image(
         self,
         prompt: str,
-        width: int,
-        height: int,
+        aspect_ratio: str,
         output_path: Path,
     ) -> Path:
-        """
-        Fetch image from Pollinations.ai.
-        Uses random seed each call, no model specified (uses their default stable model).
-        """
-        seed = random.randint(1, 999999)
-        encoded = urllib.parse.quote(prompt)
-
-        # No &model= parameter — let Pollinations use its most stable default
-        url = (
-            f"https://image.pollinations.ai/prompt/{encoded}"
-            f"?width={width}&height={height}"
-            f"&seed={seed}&nologo=true"
+        enhanced_prompt = (
+            f"{prompt}. "
+            f"Cinematic lighting, dramatic atmosphere, "
+            f"professional photography, dark moody aesthetic, "
+            f"ultra high quality, Instagram-ready visual."
         )
-
-        log.info(f"Pollinations: prompt='{prompt[:50]}...' seed={seed} size={width}x{height}")
-
-        async with httpx.AsyncClient(timeout=90.0, follow_redirects=True) as client:
-            r = await client.get(url)
-            if r.status_code != 200:
-                raise RuntimeError(f"HTTP {r.status_code}")
-            if len(r.content) < 5000:
-                raise RuntimeError(f"Response too small ({len(r.content)} bytes) — likely error page")
-
-        output_path.write_bytes(r.content)
-        log.info(f"Image saved: {output_path} ({len(r.content)/1024:.0f} KB)")
-        return output_path
-
+ 
+        log.info(f"Calling gemini-2.5-flash-image, ratio={aspect_ratio}")
+ 
+        response = await asyncio.to_thread(
+            self.client.models.generate_content,
+            model="gemini-2.5-flash-image",
+            contents=enhanced_prompt,
+            config=types.GenerateContentConfig(
+                response_modalities=["IMAGE"],
+                image_config=types.ImageConfig(
+                    aspect_ratio=aspect_ratio,
+                ),
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                    disable=True
+                ),
+            ),
+        )
+ 
+        for part in response.candidates[0].content.parts:
+            if part.inline_data is not None:
+                image_data = part.inline_data.data
+                if isinstance(image_data, str):
+                    image_data = base64.b64decode(image_data)
+                output_path.write_bytes(image_data)
+                log.info(f"Image saved: {output_path} ({len(image_data)//1024}KB)")
+                return output_path
+ 
+        raise RuntimeError("No image data in Gemini response")
+ 
     def _generate_gradient(
         self,
         width: int,
@@ -123,56 +116,36 @@ class ImageGenerator:
         output_path: Path,
         prompt: str,
     ) -> Path:
-        """
-        Generate a solid color background using FFmpeg.
-        Uses topic keywords to pick a fitting dark color.
-        Never fails — pure local generation, no internet needed.
-        """
         color = self._pick_color(prompt)
-
         cmd = [
-            "ffmpeg", "-y",
-            "-f", "lavfi",
+            "ffmpeg", "-y", "-f", "lavfi",
             "-i", f"color=c=0x{color}:s={width}x{height}",
             "-frames:v", "1",
             str(output_path),
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
-
         if result.returncode != 0:
-            log.warning(f"FFmpeg gradient failed: {result.stderr[:200]}")
-            # Absolute last resort: black image
-            cmd2 = [
-                "ffmpeg", "-y",
-                "-f", "lavfi",
+            subprocess.run([
+                "ffmpeg", "-y", "-f", "lavfi",
                 "-i", f"color=c=black:s={width}x{height}",
-                "-frames:v", "1",
-                str(output_path),
-            ]
-            subprocess.run(cmd2, capture_output=True)
-
-        log.info(f"Gradient image saved: {output_path}")
+                "-frames:v", "1", str(output_path),
+            ], capture_output=True)
+        log.info(f"Gradient saved: {output_path}")
         return output_path
-
+ 
     @staticmethod
     def _pick_color(prompt: str) -> str:
-        """Pick a dark background color based on topic mood."""
-        prompt_lower = prompt.lower()
-        color_map = {
-            "stoic": "0D1B2A",
-            "philosoph": "1A1A2E",
-            "motivat": "1A0A2E",
-            "mindful": "0D2818",
-            "success": "0A1628",
-            "nature": "0D2010",
-            "space": "030418",
-            "tech": "0D1B2A",
-            "fitness": "1A0808",
-            "love": "1A0818",
-            "wisdom": "1A1408",
-            "life": "0D1020",
+        colors = {
+            "stoic": "0D1B2A", "philosoph": "1A1A2E",
+            "motivat": "1A0A2E", "mindful": "0D2818",
+            "success": "0A1628", "nature": "0D2010",
+            "space": "030418", "tech": "0D1B2A",
+            "fitness": "1A0808", "love": "1A0818",
+            "wisdom": "1A1408", "life": "0D1020",
         }
-        for keyword, color in color_map.items():
-            if keyword in prompt_lower:
-                return color
-        return "0D1B2A"  # Default: deep navy
+        p = prompt.lower()
+        for kw, c in colors.items():
+            if kw in p:
+                return c
+        return "0D1B2A"
+ 
