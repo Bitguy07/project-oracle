@@ -1,12 +1,11 @@
 """
-Image generation via Gemini native image output.
+Image generation via Hugging Face Inference Router.
+Model: black-forest-labs/FLUX.1-dev  (free tier, high quality)
 
-FREE TIER MODEL (confirmed working, March 2026):
-    gemini-2.0-flash-exp-image-generation   ← THE ONLY FREE ONE
-    — DO NOT use gemini-2.5-flash-image     ← limit: 0 on free tier (quota = 0)
-    — DO NOT use generate_images()          ← that is Imagen 4, paid only
+Endpoint: https://router.huggingface.co  ← NOT api-inference.huggingface.co (deprecated)
+Auth:     HF_TOKEN env var (huggingface.co → Settings → Tokens → read + inference)
 
-API:  client.models.generate_content() with response_modalities=["IMAGE", "TEXT"]
+Aspect ratio: prompt-injected (9:16 for reels, 4:5 for feed)
 Fallback: FFmpeg solid-color gradient.
 """
 
@@ -17,20 +16,17 @@ import os
 import subprocess
 from pathlib import Path
 
-from google import genai
-from google.genai import types
+import httpx
 
 log = logging.getLogger("oracle.image")
 
 ASSETS_DIR = Path("assets/images")
 ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 
-DIMENSIONS   = {"reel": (1080, 1920), "feed": (1080, 1350)}
-ASPECT_HINTS = {"reel": "portrait 9:16 vertical", "feed": "portrait 4:5 vertical"}
+HF_URL = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-dev/v1/text-to-image"
 
-# gemini-2.5-flash-image      = free tier quota IS 0 — DO NOT USE
-# gemini-2.0-flash-exp-image-generation = free tier, confirmed working
-IMAGE_MODEL = "gemini-2.0-flash-exp-image-generation"
+DIMENSIONS   = {"reel": (1080, 1920), "feed": (1080, 1350)}
+ASPECT_HINTS = {"reel": "portrait 9:16 vertical composition", "feed": "portrait 4:5 vertical composition"}
 
 TOPIC_COLORS = {
     "stoic": "0D1B2A", "philosoph": "1A1A2E", "motivat": "1A0A2E",
@@ -42,10 +38,9 @@ TOPIC_COLORS = {
 
 class ImageGenerator:
     def __init__(self):
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key:
-            raise EnvironmentError("GEMINI_API_KEY not set.")
-        self.client = genai.Client(api_key=api_key)
+        self.hf_token = os.environ.get("HF_TOKEN")
+        if not self.hf_token:
+            raise EnvironmentError("HF_TOKEN not set.")
 
     async def generate(self, prompt: str, post_type: str = "reel") -> Path:
         w, h = DIMENSIONS.get(post_type, (1080, 1920))
@@ -57,70 +52,69 @@ class ImageGenerator:
             return out
 
         try:
-            return await self._call_with_retry(prompt, post_type, out)
+            return await self._call_with_retry(prompt, post_type, out, w, h)
         except Exception as e:
             log.warning(f"Image generation failed: {e}")
 
         log.warning("Falling back to gradient image.")
         return self._gradient(w, h, out, prompt)
 
-    async def _call_with_retry(self, prompt: str, post_type: str, out: Path) -> Path:
+    async def _call_with_retry(self, prompt: str, post_type: str, out: Path, w: int, h: int) -> Path:
         last_exc = None
         for attempt in range(3):
             try:
-                return await self._call(prompt, post_type, out)
+                return await self._call(prompt, post_type, out, w, h)
             except Exception as e:
                 last_exc = e
                 err_str = str(e)
-                # Parse retry delay from 429 response if present
-                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                    import re
-                    match = re.search(r"retry[^\d]*(\d+)", err_str, re.IGNORECASE)
-                    delay = int(match.group(1)) + 2 if match else 60
-                    log.warning(f"Rate limited — waiting {delay}s before retry {attempt + 1}/3")
-                    await asyncio.sleep(delay)
+                if "503" in err_str or "loading" in err_str.lower():
+                    # Model is cold-starting — wait and retry
+                    log.warning(f"Model loading, waiting 20s (attempt {attempt + 1}/3)")
+                    await asyncio.sleep(20)
+                elif "429" in err_str:
+                    log.warning(f"Rate limited, waiting 60s (attempt {attempt + 1}/3)")
+                    await asyncio.sleep(60)
                 else:
-                    log.warning(f"Image attempt {attempt + 1}/3 failed: {e}")
-                    if attempt < 2:
-                        await asyncio.sleep(3.0)
+                    log.warning(f"Attempt {attempt + 1}/3 failed: {e}")
+                    await asyncio.sleep(3)
         raise last_exc
 
-    async def _call(self, prompt: str, post_type: str, out: Path) -> Path:
-        aspect_hint = ASPECT_HINTS.get(post_type, "portrait 9:16 vertical")
+    async def _call(self, prompt: str, post_type: str, out: Path, w: int, h: int) -> Path:
+        aspect_hint = ASPECT_HINTS.get(post_type, "portrait 9:16 vertical composition")
         enhanced = (
-            f"{prompt}. "
-            f"Composition: {aspect_hint}. "
+            f"{prompt}. {aspect_hint}. "
             "Cinematic dramatic lighting, dark moody atmosphere, "
             "ultra high quality, professional photography, Instagram-ready. "
             "No text or watermarks."
         )
-        log.info(f"Calling {IMAGE_MODEL} | post_type={post_type}")
+        log.info(f"Calling FLUX.1-dev via HF router | post_type={post_type}")
 
-        response = await asyncio.to_thread(
-            self.client.models.generate_content,
-            model=IMAGE_MODEL,
-            contents=enhanced,
-            config=types.GenerateContentConfig(
-                response_modalities=["IMAGE", "TEXT"],
-            ),
-        )
+        async with httpx.AsyncClient(timeout=120) as client:
+            response = await client.post(
+                HF_URL,
+                headers={
+                    "Authorization": f"Bearer {self.hf_token}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "inputs": enhanced,
+                    "parameters": {
+                        "width": w,
+                        "height": h,
+                    }
+                },
+            )
 
-        parts = []
-        try:
-            parts = response.candidates[0].content.parts
-        except (AttributeError, IndexError):
-            pass
+        if response.status_code != 200:
+            raise RuntimeError(f"HF {response.status_code}: {response.text[:200]}")
 
-        for part in parts:
-            inline = getattr(part, "inline_data", None)
-            if inline and getattr(inline, "data", None):
-                out.write_bytes(inline.data)
-                log.info(f"Image saved: {out} ({len(inline.data) // 1024} KB)")
-                return out
+        content_type = response.headers.get("content-type", "")
+        if "image" not in content_type:
+            raise RuntimeError(f"Expected image, got {content_type}: {response.text[:200]}")
 
-        raise RuntimeError(
-            f"No image in response. Parts: {[type(p).__name__ for p in parts]}"
-        )
+        out.write_bytes(response.content)
+        log.info(f"Image saved: {out} ({len(response.content) // 1024} KB)")
+        return out
 
     def _gradient(self, w: int, h: int, out: Path, prompt: str) -> Path:
         color = next(
