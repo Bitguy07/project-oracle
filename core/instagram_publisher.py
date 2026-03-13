@@ -1,5 +1,4 @@
 """
-
 Publishing flow:
   1. Upload MP4 to GitHub repo at temp/{timestamp}.mp4
   2. Use raw.githubusercontent.com URL — direct CDN, ZERO redirects

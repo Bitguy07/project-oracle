@@ -1,5 +1,4 @@
 """
-core/state_manager.py
 Persistence layer using GitHub Gist as a zero-cost key-value store.
 Falls back to local config.json for development/testing.
 

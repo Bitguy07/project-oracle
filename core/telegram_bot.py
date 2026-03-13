@@ -1,5 +1,4 @@
 """
-core/telegram_bot.py
 Telegram Bot — Command & Control (C2) for Project Oracle.
 
 Commands:

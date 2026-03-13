@@ -1,5 +1,4 @@
 """
-core/video_renderer.py
 FFmpeg-powered video renderer.
  
 Instagram API video requirements:
