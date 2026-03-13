@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import textwrap
+
 from google import genai
 from google.genai import types
 
@@ -60,6 +61,19 @@ Constraints (apply silently):
 - color_scheme: colors must match the emotional tone
 """
 
+# Fallback content if Gemini fails entirely
+_FALLBACK = {
+    "hook": "Silence speaks what words cannot.",
+    "body": "In stillness, answers emerge. The mind finds clarity when it stops searching.",
+    "cta": "Save this for when you need it.",
+    "image_prompt": (
+        "Dark cinematic landscape at golden hour, dramatic storm clouds parting "
+        "to reveal a single beam of light, ultra-HD, moody and powerful."
+    ),
+    "color_scheme": {"primary": "#FFFFFF", "accent": "#FFD700", "shadow": "#000000"},
+    "hashtags": ["#mindset", "#wisdom", "#motivation", "#clarity", "#growth", "#inspiration"],
+}
+
 
 class IntelligenceEngine:
 
@@ -67,23 +81,24 @@ class IntelligenceEngine:
         api_key = os.environ.get("GEMINI_API_KEY")
         if not api_key:
             raise EnvironmentError("GEMINI_API_KEY not set.")
-
-        self.client = genai.Client()
+        # FIX: api_key must be passed explicitly — relying on auto-pickup is
+        # unreliable in CI / GitHub Actions environments.
+        self.client = genai.Client(api_key=api_key)
 
     async def generate_content(self, topic: str, post_type: str = "reel") -> dict:
         prompt = CONTENT_PROMPT.format(topic=topic, post_type=post_type)
-
         log.info(f"Generating content for topic='{topic}' ({post_type})")
 
-        raw = await self._generate_with_retry(prompt)
-
-        cleaned = self._extract_json(raw)
-
         try:
+            raw = await self._generate_with_retry(prompt)
+            cleaned = self._extract_json(raw)
             data = json.loads(cleaned)
         except json.JSONDecodeError as e:
-            log.error(f"JSON parse failed:\n{raw[:400]}")
-            raise ValueError(f"Gemini returned invalid JSON: {e}")
+            log.error(f"JSON parse failed — using fallback. Error: {e}")
+            data = dict(_FALLBACK)
+        except Exception as e:
+            log.error(f"Gemini content generation failed — using fallback. Error: {e}")
+            data = dict(_FALLBACK)
 
         data = self._normalize_schema(data)
 
@@ -95,29 +110,28 @@ class IntelligenceEngine:
 
         text_layers = self._build_text_layers(
             hook=data["hook"],
-            color_scheme=color_scheme
+            color_scheme=color_scheme,
         )
 
         hashtags_list = data.get("hashtags", [])
-        hashtags_str = " ".join(hashtags_list)
-
-        full_caption = f"{data['caption'].strip()}\n\n{hashtags_str}".strip()
+        hashtags_str  = " ".join(hashtags_list)
+        full_caption  = f"{data['caption'].strip()}\n\n{hashtags_str}".strip()
 
         return {
-            "hook": data["hook"],
-            "body": data["body"],
-            "cta": data["cta"],
-            "caption": full_caption,
-            "hashtags": hashtags_list,
+            "hook":         data["hook"],
+            "body":         data["body"],
+            "cta":          data["cta"],
+            "caption":      full_caption,
+            "hashtags":     hashtags_list,
             "image_prompt": data["image_prompt"],
             "color_scheme": color_scheme,
-            "text_layers": text_layers,
+            "text_layers":  text_layers,
         }
 
     async def _generate_with_retry(self, prompt: str) -> str:
+        last_exc = None
 
         for attempt in range(3):
-
             try:
                 response = await asyncio.to_thread(
                     self.client.models.generate_content,
@@ -127,78 +141,101 @@ class IntelligenceEngine:
                         temperature=GENERATION_CONFIG["temperature"],
                         topP=GENERATION_CONFIG["top_p"],
                         maxOutputTokens=GENERATION_CONFIG["max_output_tokens"],
-                        response_mime_type="application/json"
-                    )
+                        response_mime_type="application/json",
+                    ),
                 )
 
-                parts = response.candidates[0].content.parts
-
-                raw = "".join(
-                    p.text for p in parts
-                    if hasattr(p, "text") and p.text
-                ).strip()
+                # FIX: safe extraction — candidates may be empty, parts may lack .text
+                raw = self._extract_text(response)
 
                 if not raw:
-                    raise ValueError("Empty Gemini response")
+                    raise ValueError("Empty response text from Gemini")
 
+                # Strip accidental markdown fences just in case
                 raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
                 raw = re.sub(r"\s*```$", "", raw)
 
-                return raw
+                return raw.strip()
 
             except Exception as e:
+                last_exc = e
+                log.warning(f"Gemini attempt {attempt + 1}/3 failed: {e}")
+                if attempt < 2:
+                    await asyncio.sleep(1.5 * (attempt + 1))  # brief back-off
 
-                log.warning(f"Gemini generation attempt {attempt+1} failed: {e}")
+        raise last_exc
 
-                if attempt == 2:
-                    raise
+    def _extract_text(self, response) -> str:
+        """
+        Safely pull text out of a Gemini response regardless of SDK version
+        quirks or unexpected response shapes.
+        """
+        # Preferred path: response.text (SDK shortcut)
+        try:
+            text = response.text
+            if text:
+                return text.strip()
+        except Exception:
+            pass
 
+        # Fallback: walk candidates → parts manually
+        try:
+            candidates = response.candidates or []
+            for candidate in candidates:
+                parts = getattr(candidate.content, "parts", []) or []
+                text = "".join(
+                    p.text for p in parts if hasattr(p, "text") and p.text
+                ).strip()
+                if text:
+                    return text
+        except Exception as e:
+            log.warning(f"Manual part extraction failed: {e}")
+
+        return ""
 
     def _extract_json(self, text: str) -> str:
         start = text.find("{")
-        end = text.rfind("}")
-
-        if start == -1 or end == -1:
-            raise ValueError("No JSON detected in Gemini response")
-
-        return text[start:end+1]
+        end   = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise ValueError(f"No JSON object found in response: {text[:200]!r}")
+        return text[start : end + 1]
 
     def _normalize_schema(self, data: dict) -> dict:
-        """
-        Fix common Gemini schema deviations.
-        """
+        # Ensure all required keys exist with sensible defaults
+        fb = _FALLBACK
+        for key in ("hook", "body", "cta", "caption", "image_prompt"):
+            if not data.get(key):
+                log.warning(f"Missing field '{key}' — using fallback value.")
+                data[key] = fb[key]
 
-        hashtags = data.get("hashtags", [])
-        normalized_tags = []
-
-        for tag in hashtags:
-            tag = tag.lower()
+        # Normalize hashtags
+        raw_tags = data.get("hashtags", fb["hashtags"])
+        if not isinstance(raw_tags, list) or not raw_tags:
+            raw_tags = fb["hashtags"]
+        normalized = []
+        for tag in raw_tags:
+            tag = str(tag).lower().strip()
             if not tag.startswith("#"):
                 tag = "#" + tag
-            normalized_tags.append(tag)
+            normalized.append(tag)
+        data["hashtags"] = normalized
 
-        data["hashtags"] = normalized_tags
-
-        color_scheme = data.get("color_scheme")
-
-        if not isinstance(color_scheme, dict):
-            data["color_scheme"] = {
-                "primary": "#FFFFFF",
-                "accent": "#FFD700",
-                "shadow": "#000000",
-            }
+        # Normalize color_scheme
+        cs = data.get("color_scheme")
+        if not isinstance(cs, dict):
+            data["color_scheme"] = dict(fb["color_scheme"])
+        else:
+            for k, default in fb["color_scheme"].items():
+                if not cs.get(k):
+                    cs[k] = default
 
         return data
 
     def _build_text_layers(self, hook: str, color_scheme: dict) -> list[dict]:
-
         accent = color_scheme.get("accent", "#FFD700")
         shadow = color_scheme.get("shadow", "#000000")
 
-        wrapped = "\n".join(
-            textwrap.wrap(hook, width=18, break_long_words=False)
-        )
-
+        wrapped    = "\n".join(textwrap.wrap(hook, width=18, break_long_words=False))
         line_count = wrapped.count("\n") + 1
 
         if line_count <= 1:
@@ -212,15 +249,15 @@ class IntelligenceEngine:
 
         return [
             {
-                "text": wrapped,
-                "y_position": 0.5,
-                "font_size": font_size,
-                "color": accent,
-                "shadow_color": shadow,
+                "text":          wrapped,
+                "y_position":    0.5,
+                "font_size":     font_size,
+                "color":         accent,
+                "shadow_color":  shadow,
                 "shadow_offset": (4, 4),
-                "shadow_blur": 8,
-                "appear_at": 0.6,
-                "bold": True,
-                "align": "center",
+                "shadow_blur":   8,
+                "appear_at":     0.6,
+                "bold":          True,
+                "align":         "center",
             }
         ]
