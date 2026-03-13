@@ -115,7 +115,9 @@ class IntelligenceEngine:
         }
 
     async def _generate_with_retry(self, prompt: str) -> str:
+
         for attempt in range(3):
+
             try:
                 response = await asyncio.to_thread(
                     self.client.models.generate_content,
@@ -129,21 +131,28 @@ class IntelligenceEngine:
                     )
                 )
 
-                raw = response.candidates[0].content.parts[0].text.strip()
+                parts = response.candidates[0].content.parts
+
+                raw = "".join(
+                    p.text for p in parts
+                    if hasattr(p, "text") and p.text
+                ).strip()
+
+                if not raw:
+                    raise ValueError("Empty Gemini response")
 
                 raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
                 raw = re.sub(r"\s*```$", "", raw)
 
-                if raw:
-                    return raw
+                return raw
 
             except Exception as e:
+
                 log.warning(f"Gemini generation attempt {attempt+1} failed: {e}")
 
                 if attempt == 2:
                     raise
 
-        raise RuntimeError("Gemini generation failed after retries")
 
     def _extract_json(self, text: str) -> str:
         start = text.find("{")
