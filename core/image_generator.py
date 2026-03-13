@@ -32,7 +32,7 @@ DIMENSIONS = {"reel": (1080, 1920), "feed": (1080, 1350)}
 ASPECT_HINTS = {"reel": "portrait 9:16 vertical", "feed": "portrait 4:5 vertical"}
 
 # Correct model name (as of early 2026, free tier)
-MODEL = "gemini-3.1-flash-image-preview"
+MODEL = "gemini-2.5-flash-image"
 
 TOPIC_COLORS = {
     "stoic": "0D1B2A", "philosoph": "1A1A2E", "motivat": "1A0A2E",
