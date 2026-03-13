@@ -78,7 +78,11 @@ class IntelligenceEngine:
                 self.client.models.generate_content,
                 model=MODEL_NAME,
                 contents=prompt,
-                config=types.GenerateContentConfig(**GENERATION_CONFIG)
+                config=types.GenerateContentConfig(
+                    temperature=GENERATION_CONFIG["temperature"],
+                    topP=GENERATION_CONFIG["top_p"],
+                    maxOutputTokens=GENERATION_CONFIG["max_output_tokens"]
+                )
             )
             raw = response.text.strip()
         except Exception as e:
@@ -87,8 +91,6 @@ class IntelligenceEngine:
 
         # ── Aggressive cleaning ───────────────────────────────────────────────
         # Remove common violations
-        raw = re.sub(r'^.*?(\{.*)$', r'\1', raw, flags=re.DOTALL | re.IGNORECASE)
-        raw = re.sub(r'^(.*?\})\s*.*$', r'\1', raw, flags=re.DOTALL | re.IGNORECASE)
         raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE | re.IGNORECASE)
         raw = re.sub(r"\s*```$", "", raw, flags=re.MULTILINE | re.IGNORECASE)
         raw = raw.strip()
