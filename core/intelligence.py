@@ -19,13 +19,12 @@ from google.genai import types
 
 log = logging.getLogger("oracle.intelligence")
 
-MODEL_NAME = "gemini-2.5-flash"           # Updated to stable 2026 model; alternatives: "gemini-2.0-flash" / "gemini-3.0-flash" if available
-# MODEL_NAME = "gemini-2.5-flash-lite"    # ← switch back only if this version becomes reliable again
+MODEL_NAME = "gemini-2.5-flash"
 
 GENERATION_CONFIG = {
-    "temperature": 0.75,    # lowered from 0.9 — less hallucination / instruction ignoring
+    "temperature": 0.75,
     "top_p": 0.92,
-    "max_output_tokens": 1024,
+    "max_output_tokens": 1500,
 }
 
 CONTENT_PROMPT = """You are a viral Instagram content creator.
@@ -55,53 +54,37 @@ Return exactly this JSON structure and nothing else:
 }}
 
 Constraints (apply silently):
-- hook:      max 10 words — this is the **only** text that appears on the video
-- image_prompt:  evocative, painterly or photorealistic, no clichés, no text overlays
-- hashtags:  5–6 niche + 1 broad, all lowercase with # prefix
-- color_scheme:  colors must match the emotional tone of the topic
+- hook: max 10 words — this is the **only** text that appears on the video
+- image_prompt: evocative, painterly or photorealistic, no clichés, no text overlays
+- hashtags: 5–6 niche + 1 broad, all lowercase with # prefix
+- color_scheme: colors must match the emotional tone of the topic
 """
 
+
 class IntelligenceEngine:
+
     def __init__(self):
         api_key = os.environ.get("GEMINI_API_KEY")
         if not api_key:
             raise EnvironmentError("GEMINI_API_KEY not set.")
-        # New SDK auto-loads from env; no explicit configure needed
+
         self.client = genai.Client()
 
     async def generate_content(self, topic: str, post_type: str = "reel") -> dict:
         prompt = CONTENT_PROMPT.format(topic=topic, post_type=post_type)
+
         log.info(f"Generating content for topic='{topic}' ({post_type})")
 
-        try:
-            response = await asyncio.to_thread(
-                self.client.models.generate_content,
-                model=MODEL_NAME,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=GENERATION_CONFIG["temperature"],
-                    topP=GENERATION_CONFIG["top_p"],
-                    maxOutputTokens=GENERATION_CONFIG["max_output_tokens"]
-                )
-            )
-            raw = response.text.strip()
-        except Exception as e:
-            log.error(f"Gemini API call failed: {e}")
-            raise
+        raw = await self._generate_with_retry(prompt)
 
-        # ── Aggressive cleaning ───────────────────────────────────────────────
-        # Remove common violations
-        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE | re.IGNORECASE)
-        raw = re.sub(r"\s*```$", "", raw, flags=re.MULTILINE | re.IGNORECASE)
-        raw = raw.strip()
+        cleaned = self._extract_json(raw)
 
         try:
-            data = json.loads(raw)
+            data = json.loads(cleaned)
         except json.JSONDecodeError as e:
-            log.error(f"JSON parse failed. First 300 chars of raw:\n{raw[:300]}")
-            raise ValueError(f"Gemini did not return valid JSON: {e}\nRaw:\n{raw[:400]}...")
+            log.error(f"JSON parse failed. Raw response:\n{raw[:400]}")
+            raise ValueError(f"Gemini returned invalid JSON: {e}")
 
-        # Default fallback color scheme
         color_scheme = data.get("color_scheme", {
             "primary": "#FFFFFF",
             "accent": "#FFD700",
@@ -115,6 +98,7 @@ class IntelligenceEngine:
 
         hashtags_list = data.get("hashtags", [])
         hashtags_str = " ".join(hashtags_list)
+
         full_caption = f"{data['caption'].strip()}\n\n{hashtags_str}".strip()
 
         return {
@@ -128,6 +112,55 @@ class IntelligenceEngine:
             "text_layers": text_layers,
         }
 
+    async def _generate_with_retry(self, prompt: str) -> str:
+        """
+        Generate Gemini content with automatic retries if response is truncated.
+        """
+        for attempt in range(3):
+            try:
+                response = await asyncio.to_thread(
+                    self.client.models.generate_content,
+                    model=MODEL_NAME,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=GENERATION_CONFIG["temperature"],
+                        topP=GENERATION_CONFIG["top_p"],
+                        maxOutputTokens=GENERATION_CONFIG["max_output_tokens"],
+                        response_mime_type="application/json"
+                    )
+                )
+
+                raw = response.text.strip()
+
+                raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE | re.IGNORECASE)
+                raw = re.sub(r"\s*```$", "", raw, flags=re.MULTILINE | re.IGNORECASE)
+
+                if raw.count("{") and raw.count("}"):
+                    return raw
+
+                raise ValueError("Response appears truncated")
+
+            except Exception as e:
+                log.warning(f"Gemini generation attempt {attempt + 1} failed: {e}")
+
+                if attempt == 2:
+                    raise
+
+        raise RuntimeError("Gemini generation failed after retries")
+
+    def _extract_json(self, text: str) -> str:
+        """
+        Extract the first valid JSON object from text.
+        Prevents prefix/suffix garbage from breaking parsing.
+        """
+        start = text.find("{")
+        end = text.rfind("}")
+
+        if start == -1 or end == -1:
+            raise ValueError("No JSON object detected in response")
+
+        return text[start:end + 1]
+
     def _build_text_layers(
         self,
         hook: str,
@@ -137,14 +170,16 @@ class IntelligenceEngine:
         Returns ONE centered text layer containing only the hook/quote.
         Word-wrap + dynamic font size to fit safely in 1080 px width.
         """
+
         accent = color_scheme.get("accent", "#FFD700")
         shadow = color_scheme.get("shadow", "#000000")
 
-        # Wrap at ~16–18 chars depending on punctuation density
-        wrapped = "\n".join(textwrap.wrap(hook, width=18, break_long_words=False))
+        wrapped = "\n".join(
+            textwrap.wrap(hook, width=18, break_long_words=False)
+        )
+
         line_count = wrapped.count("\n") + 1
 
-        # Scale font size down gracefully
         if line_count <= 1:
             font_size = 96
         elif line_count == 2:
@@ -157,11 +192,11 @@ class IntelligenceEngine:
         return [
             {
                 "text": wrapped,
-                "y_position": 0.5,          # true center
+                "y_position": 0.5,
                 "font_size": font_size,
                 "color": accent,
                 "shadow_color": shadow,
-                "shadow_offset": (4, 4),    # optional — many renderers support it
+                "shadow_offset": (4, 4),
                 "shadow_blur": 8,
                 "appear_at": 0.6,
                 "bold": True,
