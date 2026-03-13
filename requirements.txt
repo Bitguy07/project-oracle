@@ -1,8 +1,8 @@
 # Project Oracle — Python Dependencies
 # Install: pip install -r requirements.txt
 
-# Google Gemini AI (legacy SDK for compatibility — deprecated but still installable)
-google-generativeai==0.8.6  # Pin to last release for stability
+# Google GenAI SDK (current, supported)
+google-genai>=0.7.0  # Latest stable; or pin if needed (e.g., ==0.7.1)
 
 # HTTP client (async)
 httpx>=0.27.0
