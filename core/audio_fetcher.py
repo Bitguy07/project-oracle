@@ -7,7 +7,7 @@ The prompt is already a rich natural language sentence like:
   "dark cinematic ambient piano, slow tempo, no vocals, contemplative mood"
 
 Model: ~300MB, cached after first download.
-Generation: ~4-5 min for 15s on GitHub Actions CPU (2 cores). Acceptable for 6hr pipeline.
+Generation: ~4-5 min for 30s on GitHub Actions CPU (2 cores). Acceptable for 6hr pipeline.
 License: CC-BY-NC 4.0 — free for non-commercial Instagram content.
 
 Fallback: bundled MP3 from assets/bundled_audio/, then silent audio.
@@ -28,7 +28,7 @@ ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 BUNDLED_DIR.mkdir(parents=True, exist_ok=True)
 
 MODEL_ID         = "facebook/musicgen-small"
-DURATION_SECONDS = 15   # 15s on GH Actions (~4min CPU), 30s locally (~10min)
+DURATION_SECONDS = 30   # 30s on GH Actions (~4min CPU), 30s locally (~10min)
 
 
 class AudioFetcher:

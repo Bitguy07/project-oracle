@@ -172,7 +172,7 @@ class VideoRenderer:
         return [
             "ffmpeg", "-y",
             "-loop", "1", "-framerate", str(FRAMERATE), "-i", str(image_path),
-            "-i", str(audio_path),
+            "-stream_loop", "-1", "-i", str(audio_path),
             "-filter_complex", filter_complex,
             "-map", "[vout]", "-map", "[aout]",
             "-c:v", "libx264", "-preset", "fast", "-crf", "22",
