@@ -66,9 +66,7 @@ jobs:
             fonts-dejavu-core \
             fonts-liberation \
             fontconfig \
-            wget \
             --no-install-recommends
-          # Download Comic Relief font from Google Fonts
           cp assets/fonts/ComicRelief-Regular.ttf /usr/share/fonts/truetype/
           cp assets/fonts/ComicRelief-Bold.ttf /usr/share/fonts/truetype/
           fc-cache -fv
