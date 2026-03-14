@@ -8,7 +8,14 @@ Pipeline modes:
 Review modes:
   auto   — Publish directly to Instagram without review
   review — Upload video to GitHub, send to Telegram, wait for /done or /no
-           Video is stored on GitHub so it survives runner shutdown between jobs.
+           Video URL stored in Gist — survives runner shutdown between jobs.
+
+Key design:
+  - Videos in review mode are uploaded to GitHub repo and NEVER deleted until:
+      a) /done <id>  → published to Instagram then deleted from GitHub
+      b) /no <id>    → deleted from GitHub immediately
+      c) /clear      → wipes all pending posts and their GitHub files
+  - pending_posts in Gist is the single source of truth
 """
 
 import asyncio
@@ -36,15 +43,29 @@ logging.basicConfig(
 log = logging.getLogger("oracle.main")
 
 
+def _sanitize_for_json(obj):
+    """Recursively convert any non-JSON-serializable objects to strings."""
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(i) for i in obj]
+    elif isinstance(obj, Path):
+        return str(obj)
+    elif isinstance(obj, (str, int, float, bool, type(None))):
+        return obj
+    else:
+        return str(obj)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Main pipeline — handles both autonomous and manual modes
+# Main pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def run_pipeline(
     post_type: str = "reel",
     topic_raw: str = "",
     music_raw: str = "",
-    mode: str = "autonomous",   # "autonomous" or "manual"
+    mode: str = "autonomous",
 ) -> dict:
     state     = StateManager()
     intel     = IntelligenceEngine()
@@ -52,7 +73,6 @@ async def run_pipeline(
     audio_fet = AudioFetcher()
     renderer  = VideoRenderer()
 
-    # ── Quota guard ────────────────────────────────────────────────────────
     if not state.has_quota():
         log.warning("Daily quota exhausted.")
         return {"status": "quota_exceeded"}
@@ -77,7 +97,6 @@ async def run_pipeline(
     topic = content["topic"]
     log.info(f"Topic: '{topic}' | Hook: '{content['hook']}'")
 
-    # ── Duplicate guard ────────────────────────────────────────────────────
     if state.was_recently_posted(topic):
         log.info(f"Topic '{topic}' recently posted — skipping.")
         return {"status": "duplicate_skipped", "topic": topic}
@@ -111,7 +130,6 @@ async def run_pipeline(
     if review_mode == "review":
         return await _send_for_review(state, content, topic, video_path, post_type)
 
-    # ── 6. Publish directly ────────────────────────────────────────────────
     return await _publish_video(
         video_path=video_path,
         content=content,
@@ -122,7 +140,7 @@ async def run_pipeline(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Review mode — upload video to GitHub so it survives runner shutdown
+# Review mode
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def _send_for_review(
@@ -132,34 +150,44 @@ async def _send_for_review(
     video_path: Path,
     post_type: str,
 ) -> dict:
-    """
-    Upload video to GitHub repo (raw URL, no redirects) so it persists
-    after this runner shuts down. Store URL in Gist state. Send to Telegram.
-    /done will download it and publish.
-    """
-    publisher = InstagramPublisher()
+    publisher  = InstagramPublisher()
     pending_id = str(uuid.uuid4())[:8]
 
-    log.info(f"Uploading video to GitHub for review storage (pending_id={pending_id})")
-
-    # Upload to GitHub repo — raw.githubusercontent.com URL has no redirects
-    # and survives runner shutdown unlike local files
+    log.info(f"Uploading video to GitHub for review (pending_id={pending_id})")
     video_url = await publisher._github_upload(video_path)
+    # Clear temp tracking on publisher — we do NOT want auto-delete here
+    # The file must persist until /done or /no
+    publisher._temp_path = None
+    publisher._temp_sha  = None
     log.info(f"Video stored at: {video_url}")
 
-    # Save pending post with GitHub URL (not local path)
+    # Sanitize content so it's always JSON-serializable before saving to Gist
+    safe_content = _sanitize_for_json({**content, "post_type": post_type})
+
+    # Verify it's serializable before saving
+    try:
+        json.dumps(safe_content)
+    except Exception as e:
+        log.error(f"Content not JSON-serializable even after sanitize: {e}")
+        safe_content = {
+            "caption":   content.get("caption", ""),
+            "post_type": post_type,
+            "topic":     content.get("topic", topic),
+        }
+
     state.save_pending_post(
         pending_id=pending_id,
         topic=topic,
-        content={**content, "post_type": post_type},
-        video_path=video_url,   # GitHub URL — persists across runners
+        content=safe_content,
+        video_path=video_url,
+        video_repo_path=publisher._get_last_repo_path(),
+        video_repo_sha=publisher._get_last_sha(),
     )
-    log.info(f"Saved pending post: {pending_id} ({topic})")
+    log.info(f"Pending post saved to Gist: {pending_id}")
 
-    # Send video to Telegram for review
     bot = TelegramBot()
     await bot.send_video_for_review(
-        video_path=video_path,   # local file for Telegram upload (still exists now)
+        video_path=video_path,
         caption=content["caption"],
         hook=content["hook"],
         pending_id=pending_id,
@@ -170,77 +198,95 @@ async def _send_for_review(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# /done <id> — download video from GitHub URL and publish to Instagram
+# /done <id>
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def publish_pending(pending_id: str) -> dict:
-    """
-    Called when user sends /done <pending_id>.
-    Downloads video from GitHub URL (where it was stored during review)
-    and publishes to Instagram.
-    """
     state   = StateManager()
     pending = state.get_pending_post(pending_id)
 
     if not pending:
         return {"status": "not_found", "message": f"No pending post: {pending_id}"}
 
-    video_path_or_url = pending["video_path"]
-    content           = pending["content"]
-    topic             = pending["topic"]
-    post_type         = content.get("post_type", "reel")
+    video_url     = pending["video_path"]
+    content       = pending["content"]
+    topic         = pending["topic"]
+    post_type     = content.get("post_type", "reel")
+    repo_path     = pending.get("video_repo_path")
+    repo_sha      = pending.get("video_repo_sha")
 
-    # ── Download video from GitHub URL to local temp file ──────────────────
-    if video_path_or_url.startswith("https://"):
-        tmp = Path(f"assets/output/pending_{pending_id}.mp4")
-        tmp.parent.mkdir(parents=True, exist_ok=True)
-        log.info(f"Downloading video from GitHub: {video_path_or_url}")
-        try:
-            async with httpx.AsyncClient(timeout=120, follow_redirects=True) as c:
-                r = await c.get(video_path_or_url)
-            if r.status_code != 200:
-                raise RuntimeError(f"Download failed: HTTP {r.status_code}")
-            tmp.write_bytes(r.content)
-            log.info(f"Video downloaded: {tmp} ({tmp.stat().st_size // 1024} KB)")
-            video_path = tmp
-        except Exception as e:
-            state.remove_pending_post(pending_id)
-            return {"status": "error", "message": f"Could not download video: {e}"}
-    else:
-        # Legacy: local path (only works if same runner)
-        video_path = Path(video_path_or_url)
-        if not video_path.exists():
-            state.remove_pending_post(pending_id)
-            return {
-                "status": "error",
-                "message": "Video file gone — runner reset. Use /now again to regenerate.",
-            }
+    # Download video from GitHub URL
+    tmp = Path(f"assets/output/pending_{pending_id}.mp4")
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    log.info(f"Downloading video: {video_url}")
+    try:
+        async with httpx.AsyncClient(timeout=120, follow_redirects=True) as c:
+            r = await c.get(video_url)
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code}")
+        tmp.write_bytes(r.content)
+        log.info(f"Video downloaded: {tmp} ({tmp.stat().st_size // 1024} KB)")
+    except Exception as e:
+        state.remove_pending_post(pending_id)
+        return {"status": "error", "message": f"Could not download video: {e}"}
 
-    # ── Publish to Instagram ───────────────────────────────────────────────
+    # Publish to Instagram
     result = await _publish_video(
-        video_path=video_path,
+        video_path=tmp,
         content=content,
         topic=topic,
         post_type=post_type,
         state=state,
     )
 
-    # Clean up temp file and pending state
-    if video_path.name.startswith("pending_"):
-        try:
-            video_path.unlink()
-        except Exception:
-            pass
-    state.remove_pending_post(pending_id)
-
-    # Also delete the temp file from GitHub repo
+    # Cleanup
     try:
-        publisher = InstagramPublisher()
-        await publisher._github_delete()
+        tmp.unlink()
     except Exception:
         pass
 
+    state.remove_pending_post(pending_id)
+
+    # Delete from GitHub repo now that it's published
+    if repo_path and repo_sha:
+        try:
+            publisher = InstagramPublisher()
+            publisher._temp_path = repo_path
+            publisher._temp_sha  = repo_sha
+            await publisher._github_delete()
+        except Exception as e:
+            log.warning(f"Could not delete GitHub file after publish: {e}")
+
     return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /no <id> — delete video from GitHub and remove from pending
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def reject_pending(pending_id: str) -> dict:
+    state   = StateManager()
+    pending = state.get_pending_post(pending_id)
+
+    if not pending:
+        return {"status": "not_found"}
+
+    repo_path = pending.get("video_repo_path")
+    repo_sha  = pending.get("video_repo_sha")
+
+    # Delete from GitHub repo
+    if repo_path and repo_sha:
+        try:
+            publisher = InstagramPublisher()
+            publisher._temp_path = repo_path
+            publisher._temp_sha  = repo_sha
+            await publisher._github_delete()
+            log.info(f"Deleted rejected video from GitHub: {repo_path}")
+        except Exception as e:
+            log.warning(f"Could not delete GitHub file on reject: {e}")
+
+    state.remove_pending_post(pending_id)
+    return {"status": "rejected", "topic": pending["topic"]}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -264,26 +310,24 @@ async def _publish_video(
     state.decrement_quota()
     log.info(f"Published! IG ID: {result.get('ig_post_id')}")
     return {
-        "status": "success",
+        "status":     "success",
         "ig_post_id": result.get("ig_post_id"),
-        "topic": topic,
+        "topic":      topic,
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Cron run — autonomous every 6 hours
+# Cron
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def cron_run():
-    """Called by GitHub Actions every 6 hours — fully autonomous."""
     state = StateManager()
     queue = state.get_topic_queue()
 
     if queue:
-        log.info(f"Queue has {len(queue)} items — processing queue.")
+        log.info(f"Queue has {len(queue)} items.")
         for item in queue:
             if not state.has_quota():
-                log.warning("Quota hit — stopping.")
                 break
             result = await run_pipeline(
                 post_type=item.get("type", "reel"),

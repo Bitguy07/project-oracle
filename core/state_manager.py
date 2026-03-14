@@ -1,17 +1,7 @@
 """
 core/state_manager.py
-Persistence via GitHub Gist (primary) or local config.json (fallback).
-
-GIST FILE: always reads/writes "oracle_state.json" specifically.
-TOKEN:     uses GIST_TOKEN first (has gist + repo scope), falls back to GITHUB_TOKEN.
-
-Schema fields:
-  quota         — daily API usage counters
-  posts         — last 50 published posts (history + dedup)
-  topic_queue   — manual topics queued for next cron run
-  topic_history — last 30 topic strings for autonomous dedup
-  pending_posts — videos awaiting /done or /no approval
-  review_mode   — "auto" or "review"
+Single source of truth: oracle_state.json on GitHub Gist.
+Uses GIST_TOKEN (gist+repo scope). Falls back to local config.json.
 """
 
 import json
@@ -37,10 +27,10 @@ DEFAULT_STATE = {
         "image_daily_limit":      50,
         "reset_date":             "",
     },
-    "posts":         [],   # last 50 published posts
-    "topic_queue":   [],   # [{id, topic, type, added_at}]
-    "topic_history": [],   # last 30 topic strings for autonomous dedup
-    "pending_posts": [],   # videos awaiting /done or /no
+    "posts":         [],
+    "topic_queue":   [],
+    "topic_history": [],
+    "pending_posts": [],
     "review_mode":   "auto",
     "last_updated":  "",
 }
@@ -54,15 +44,14 @@ class StateManager:
 
     def __init__(self):
         self.gist_id      = os.environ.get("GIST_ID")
-        # GIST_TOKEN has gist+repo scope; fall back to GITHUB_TOKEN
         self.github_token = (
             os.environ.get("GIST_TOKEN") or os.environ.get("GITHUB_TOKEN")
         )
-        self.local_path   = Path("config.json")
+        self.local_path = Path("config.json")
         self._state: dict = self._load()
         self._reset_quota_if_new_day()
 
-    # ── Quota ──────────────────────────────────────────────────────────────────
+    # ── Quota ──────────────────────────────────────────────────────────────
 
     def has_quota(self) -> bool:
         q = self._state["quota"]
@@ -77,13 +66,13 @@ class StateManager:
         q["images_generated_today"] += images
         self._save()
 
-    # ── Posts + dedup ──────────────────────────────────────────────────────────
+    # ── Posts ──────────────────────────────────────────────────────────────
 
     def was_recently_posted(self, topic: str) -> bool:
         cutoff = time.time() - RECENT_TOPIC_HOURS * 3600
         return any(
             p.get("topic", "").lower() == topic.lower() and p.get("ts", 0) > cutoff
-            for p in self._state["posts"]
+            for p in self._state.get("posts", [])
         )
 
     def record_post(self, topic: str, caption: str, ig_id: Optional[str]):
@@ -95,10 +84,10 @@ class StateManager:
             "ts":      time.time(),
             "date":    datetime.now(timezone.utc).isoformat(),
         }
-        self._state["posts"].insert(0, post)
-        self._state["posts"] = self._state["posts"][:MAX_POSTS_HISTORY]
+        posts = self._state.setdefault("posts", [])
+        posts.insert(0, post)
+        self._state["posts"] = posts[:MAX_POSTS_HISTORY]
 
-        # Also record in topic_history for autonomous dedup
         hist = self._state.setdefault("topic_history", [])
         if topic not in hist:
             hist.insert(0, topic)
@@ -106,10 +95,10 @@ class StateManager:
 
         self._save()
 
-    def get_topic_history(self) -> list[str]:
+    def get_topic_history(self) -> list:
         return list(self._state.get("topic_history", []))
 
-    # ── Queue ──────────────────────────────────────────────────────────────────
+    # ── Queue ──────────────────────────────────────────────────────────────
 
     def get_topic_queue(self) -> list:
         return list(self._state.get("topic_queue", []))
@@ -123,7 +112,6 @@ class StateManager:
             "added_at": datetime.now(timezone.utc).isoformat(),
         })
         self._save()
-        log.info(f"Queued: [{item_id}] {topic} ({post_type})")
         return item_id
 
     def remove_from_queue(self, item_id: str):
@@ -132,7 +120,7 @@ class StateManager:
         ]
         self._save()
 
-    # ── Review mode ────────────────────────────────────────────────────────────
+    # ── Review mode ────────────────────────────────────────────────────────
 
     def get_review_mode(self) -> str:
         return self._state.get("review_mode", "auto")
@@ -141,7 +129,7 @@ class StateManager:
         self._state["review_mode"] = mode
         self._save()
 
-    # ── Pending posts ──────────────────────────────────────────────────────────
+    # ── Pending posts ──────────────────────────────────────────────────────
 
     def save_pending_post(
         self,
@@ -149,16 +137,38 @@ class StateManager:
         topic: str,
         content: dict,
         video_path: str,
+        video_repo_path: str = "",
+        video_repo_sha:  str = "",
     ):
+        """
+        Save a pending post to Gist.
+        content must already be JSON-serializable (sanitized in main.py).
+        video_path      = raw.githubusercontent.com URL (for downloading)
+        video_repo_path = temp/xxx.mp4 path in repo (for deletion)
+        video_repo_sha  = sha of the file (for deletion)
+        """
+        # Final safety check — ensure serializable
+        try:
+            json.dumps(content)
+        except Exception as e:
+            log.error(f"Content not serializable, stripping to basics: {e}")
+            content = {
+                "caption":   str(content.get("caption", "")),
+                "post_type": str(content.get("post_type", "reel")),
+                "topic":     str(topic),
+            }
+
         self._state.setdefault("pending_posts", []).append({
-            "id":         pending_id,
-            "topic":      topic,
-            "content":    content,
-            "video_path": video_path,
-            "ts":         time.time(),
+            "id":              pending_id,
+            "topic":           topic,
+            "content":         content,
+            "video_path":      video_path,
+            "video_repo_path": video_repo_path,
+            "video_repo_sha":  video_repo_sha,
+            "ts":              time.time(),
         })
         self._save()
-        log.info(f"Saved pending post: {pending_id} ({topic})")
+        log.info(f"Pending post saved: {pending_id} ({topic})")
 
     def get_pending_post(self, pending_id: str) -> Optional[dict]:
         return next(
@@ -175,10 +185,16 @@ class StateManager:
         ]
         self._save()
 
-    # ── Stats ──────────────────────────────────────────────────────────────────
+    def clear_all_pending(self):
+        """Called by /clear — wipes all pending posts."""
+        self._state["pending_posts"] = []
+        self._save()
+
+    # ── Stats ──────────────────────────────────────────────────────────────
 
     def get_stats(self) -> dict:
         q = self._state["quota"]
+        posts = self._state.get("posts", [])
         return {
             "gemini_used":   q["gemini_used_today"],
             "gemini_limit":  q["gemini_daily_limit"],
@@ -186,22 +202,20 @@ class StateManager:
             "image_limit":   q["image_daily_limit"],
             "queue_length":  len(self._state.get("topic_queue", [])),
             "pending_count": len(self._state.get("pending_posts", [])),
-            "total_posts":   len(self._state.get("posts", [])),
-            "last_post":     self._state["posts"][0] if self._state.get("posts") else None,
+            "total_posts":   len(posts),
+            "last_post":     posts[0] if posts else None,
             "reset_date":    q["reset_date"],
             "review_mode":   self._state.get("review_mode", "auto"),
         }
 
-    # ── Persistence ────────────────────────────────────────────────────────────
+    # ── Persistence ────────────────────────────────────────────────────────
 
     def _load(self) -> dict:
         if self.gist_id and self.github_token:
             try:
                 data = self._load_from_gist()
-                # Merge any missing keys (handles schema upgrades)
                 for key, val in DEFAULT_STATE.items():
                     data.setdefault(key, val)
-                # Ensure quota sub-keys exist too
                 for key, val in DEFAULT_STATE["quota"].items():
                     data["quota"].setdefault(key, val)
                 return data
@@ -215,7 +229,6 @@ class StateManager:
                 data.setdefault(key, val)
             return data
 
-        log.info("No state found — initialising defaults.")
         return json.loads(json.dumps(DEFAULT_STATE))
 
     def _save(self):
@@ -223,10 +236,10 @@ class StateManager:
         if self.gist_id and self.github_token:
             try:
                 self._save_to_gist()
-                log.info("Gist state saved OK")
+                log.info("Gist saved OK")
                 return
             except Exception as e:
-                log.error(f"Gist save FAILED: {e} — saving locally (will not persist across jobs!)")
+                log.error(f"Gist save FAILED: {e} — saving locally only!")
         with open(self.local_path, "w") as f:
             json.dump(self._state, f, indent=2)
 
@@ -237,60 +250,47 @@ class StateManager:
                 "Authorization": f"token {self.github_token}",
                 "Accept":        "application/vnd.github.v3+json",
             },
-            timeout=10,
+            timeout=15,
         )
         r.raise_for_status()
         files = r.json()["files"]
-
-        # Always read from oracle_state.json specifically
         if GIST_FILENAME in files:
             return json.loads(files[GIST_FILENAME].get("content", "{}"))
-
-        # Fallback: first .json file (handles legacy setups)
         for fname, fdata in files.items():
             if fname.endswith(".json"):
-                log.warning(f"oracle_state.json not found, reading {fname} instead")
                 return json.loads(fdata.get("content", "{}"))
-
         raise ValueError("No JSON file in Gist")
 
     def _save_to_gist(self):
-        headers = {
-            "Authorization": f"token {self.github_token}",
-            "Content-Type":  "application/json",
-            "Accept":        "application/vnd.github.v3+json",
-        }
-        payload = {
-            "files": {
-                GIST_FILENAME: {
-                    "content": json.dumps(self._state, indent=2)
-                }
-            }
-        }
+        # Verify serializable before sending
+        content_str = json.dumps(self._state, indent=2)
+
         last_exc = None
         for attempt in range(3):
             try:
                 r = requests.patch(
                     f"https://api.github.com/gists/{self.gist_id}",
-                    headers=headers,
-                    json=payload,
-                    timeout=30,  # increased from 10s
+                    headers={
+                        "Authorization": f"token {self.github_token}",
+                        "Content-Type":  "application/json",
+                        "Accept":        "application/vnd.github.v3+json",
+                    },
+                    json={"files": {GIST_FILENAME: {"content": content_str}}},
+                    timeout=30,
                 )
                 r.raise_for_status()
-                log.debug(f"Gist saved OK (attempt {attempt+1})")
                 return
             except Exception as e:
                 last_exc = e
-                log.warning(f"Gist save attempt {attempt+1}/3 failed: {e}")
+                log.warning(f"Gist save attempt {attempt+1}/3: {e}")
                 if attempt < 2:
-                    import time as _time
-                    _time.sleep(2)
+                    import time as _t
+                    _t.sleep(2)
         raise last_exc
 
     def _reset_quota_if_new_day(self):
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if self._state["quota"].get("reset_date") != today:
-            log.info(f"New day ({today}) — resetting quota.")
             self._state["quota"]["gemini_used_today"]      = 0
             self._state["quota"]["images_generated_today"] = 0
             self._state["quota"]["reset_date"]             = today

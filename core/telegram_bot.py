@@ -239,7 +239,8 @@ class TelegramBot:
                 if not pending:
                     reply = f"❌ Not found: <code>{pending_id}</code>"
                 else:
-                    state.remove_pending_post(pending_id)
+                    import main as oracle_main
+                    await oracle_main.reject_pending(pending_id)
                     reply = f"🗑️ Rejected.\nTopic: <b>{pending['topic']}</b>"
             await self.send_message(reply, chat_id)
             return reply
@@ -303,9 +304,20 @@ class TelegramBot:
 
         # ── /clear ─────────────────────────────────────────────────────────────
         elif text == "/clear":
+            # Clear queue
             state._state["topic_queue"] = []
+            # Also reject all pending videos (deletes from GitHub too)
+            pending_all = state.get_all_pending_posts()
+            state.clear_all_pending()
             state._save()
-            reply = "🗑️ Queue cleared."
+            import main as oracle_main
+            for p in pending_all:
+                try:
+                    await oracle_main.reject_pending(p["id"])
+                except Exception:
+                    pass
+            pending_note = f" + {len(pending_all)} pending video(s) cleared" if pending_all else ""
+            reply = f"🗑️ Queue cleared{pending_note}."
             await self.send_message(reply, chat_id)
             return reply
 
