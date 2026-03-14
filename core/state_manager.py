@@ -176,7 +176,11 @@ class StateManager:
     def _load(self) -> dict:
         if self.gist_id and self.github_token:
             try:
-                return self._load_from_gist()
+                data = self._load_from_gist()
+                # Merge any missing keys from DEFAULT_STATE (handles schema upgrades)
+                for key, val in DEFAULT_STATE.items():
+                    data.setdefault(key, val)
+                return data
             except Exception as e:
                 log.warning(f"Gist load failed: {e} — using local.")
 
