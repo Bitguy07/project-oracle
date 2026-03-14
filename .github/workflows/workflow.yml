@@ -2,9 +2,9 @@
 # Project Oracle — Automated Instagram Content Pipeline
 #
 # Triggers:
-#   1. CRON: Runs every 6 hours to drain the topic queue
-#   2. workflow_dispatch: Manual trigger from GitHub UI (with optional topic)
-#   3. repository_dispatch: Triggered by Telegram webhook (via external service)
+#   1. CRON: Runs every 6 hours — autonomous mode (AI picks everything)
+#   2. workflow_dispatch: Manual trigger from GitHub UI
+#   3. repository_dispatch: Triggered by Telegram webhook (type: telegram_command)
 
 name: 🔮 Project Oracle — Content Pipeline
 
@@ -17,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       topic:
-        description: "Topic to post about (leave blank to drain queue)"
+        description: "Topic to post about (leave blank for autonomous)"
         required: false
         default: ""
       post_type:
@@ -34,12 +34,10 @@ on:
         default: "cron"
         type: choice
         options:
-          - cron        # Drain full queue
-          - single      # Post single topic from input
+          - cron        # Drain queue or autonomous
+          - single      # Post single topic from input above
 
   # ── Triggered by Telegram webhook (via GitHub API) ─────────────────────────
-  # Call this via: POST /repos/{owner}/{repo}/dispatches
-  # with body: {"event_type": "telegram_command", "client_payload": {...}}
   repository_dispatch:
     types: [telegram_command]
 
@@ -50,14 +48,16 @@ jobs:
   oracle-pipeline:
     name: 🚀 Run Oracle Pipeline
     runs-on: ubuntu-latest
-    timeout-minutes: 30   # Safety cutoff
+    timeout-minutes: 60   # MusicGen takes ~10min on CPU — needs generous limit
 
     steps:
-      # ── Checkout ─────────────────────────────────────────────────────────
+      # ── Checkout (with LFS for bundled audio) ─────────────────────────────
       - name: 📥 Checkout repository
         uses: actions/checkout@v4
+        with:
+          lfs: true
 
-      # ── System dependencies (FFmpeg + fonts) ──────────────────────────────
+      # ── System dependencies ────────────────────────────────────────────────
       - name: 🎬 Install system dependencies
         run: |
           sudo apt-get update -qq
@@ -77,43 +77,53 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: "pip"
 
+      # ── PyTorch CPU (separate step — large download, benefits from caching) -
+      - name: 🔦 Install PyTorch CPU
+        run: |
+          pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+      # ── Python dependencies ────────────────────────────────────────────────
       - name: 📦 Install Python dependencies
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ── Environment secrets ────────────────────────────────────────────────
-      # All secrets must be configured in:
-      # Repository → Settings → Secrets and variables → Actions
+      # ── Cache MusicGen model weights (~300MB, downloads once) ─────────────
+      - name: 🎵 Cache MusicGen weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: musicgen-small-v1
+          restore-keys: musicgen-small-
+
+      # ── Verify secrets ────────────────────────────────────────────────────
       - name: 🔐 Verify required secrets
         run: |
           echo "Checking required secrets..."
-          [ -n "${{ secrets.GEMINI_API_KEY }}" ] && echo "✅ GEMINI_API_KEY set" || echo "❌ GEMINI_API_KEY MISSING"
-          [ -n "${{ secrets.IG_ACCESS_TOKEN }}" ] && echo "✅ IG_ACCESS_TOKEN set" || echo "❌ IG_ACCESS_TOKEN MISSING"
-          [ -n "${{ secrets.IG_USER_ID }}" ] && echo "✅ IG_USER_ID set" || echo "❌ IG_USER_ID MISSING"
-          [ -n "${{ secrets.GITHUB_TOKEN }}" ] && echo "✅ GITHUB_TOKEN set" || echo "❌ GITHUB_TOKEN MISSING"
+          [ -n "${{ secrets.GEMINI_API_KEY }}" ]   && echo "✅ GEMINI_API_KEY"   || echo "❌ GEMINI_API_KEY MISSING"
+          [ -n "${{ secrets.IG_ACCESS_TOKEN }}" ]  && echo "✅ IG_ACCESS_TOKEN"  || echo "❌ IG_ACCESS_TOKEN MISSING"
+          [ -n "${{ secrets.IG_USER_ID }}" ]       && echo "✅ IG_USER_ID"       || echo "❌ IG_USER_ID MISSING"
+          [ -n "${{ secrets.HF_TOKEN }}" ]         && echo "✅ HF_TOKEN"         || echo "❌ HF_TOKEN MISSING (image generation will fail)"
           echo "Optional:"
-          [ -n "${{ secrets.GIST_ID }}" ] && echo "✅ GIST_ID set" || echo "⚠️  GIST_ID not set (will use local config.json)"
-          [ -n "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] && echo "✅ TELEGRAM_BOT_TOKEN set" || echo "⚠️  TELEGRAM_BOT_TOKEN not set"
-          [ -n "${{ secrets.PIXABAY_API_KEY }}" ] && echo "✅ PIXABAY_API_KEY set" || echo "⚠️  PIXABAY_API_KEY not set (silent audio fallback)"
-          [ -n "${{ secrets.HF_TOKEN }}" ] && echo "✅ HF_TOKEN set" || echo "⚠️  HF_TOKEN not set (Pollinations only)"
+          [ -n "${{ secrets.GIST_ID }}" ]          && echo "✅ GIST_ID"          || echo "⚠️  GIST_ID not set (local config.json fallback)"
+          [ -n "${{ secrets.GIST_TOKEN }}" ]       && echo "✅ GIST_TOKEN"       || echo "⚠️  GIST_TOKEN not set"
+          [ -n "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] && echo "✅ TELEGRAM_BOT_TOKEN" || echo "⚠️  TELEGRAM_BOT_TOKEN not set"
 
-      # ── CRON / Queue drain mode ────────────────────────────────────────────
-      - name: 🔁 Run pipeline (CRON — drain queue)
+      # ── CRON / Autonomous mode ─────────────────────────────────────────────
+      - name: 🤖 Run pipeline (CRON — autonomous)
         if: |
           github.event_name == 'schedule' ||
           (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'cron')
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
-          IG_USER_ID: ${{ secrets.IG_USER_ID }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GIST_ID: ${{ secrets.GIST_ID }}
+          GEMINI_API_KEY:     ${{ secrets.GEMINI_API_KEY }}
+          HF_TOKEN:           ${{ secrets.HF_TOKEN }}
+          IG_ACCESS_TOKEN:    ${{ secrets.IG_ACCESS_TOKEN }}
+          IG_USER_ID:         ${{ secrets.IG_USER_ID }}
+          GITHUB_TOKEN:       ${{ secrets.GITHUB_TOKEN }}
+          GIST_ID:            ${{ secrets.GIST_ID }}
+          GIST_TOKEN:         ${{ secrets.GIST_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python main.py cron
 
       # ── Single topic mode (manual dispatch) ───────────────────────────────
@@ -123,16 +133,15 @@ jobs:
           github.event.inputs.mode == 'single' &&
           github.event.inputs.topic != ''
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
-          IG_USER_ID: ${{ secrets.IG_USER_ID }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GIST_ID: ${{ secrets.GIST_ID }}
+          GEMINI_API_KEY:     ${{ secrets.GEMINI_API_KEY }}
+          HF_TOKEN:           ${{ secrets.HF_TOKEN }}
+          IG_ACCESS_TOKEN:    ${{ secrets.IG_ACCESS_TOKEN }}
+          IG_USER_ID:         ${{ secrets.IG_USER_ID }}
+          GITHUB_TOKEN:       ${{ secrets.GITHUB_TOKEN }}
+          GIST_ID:            ${{ secrets.GIST_ID }}
+          GIST_TOKEN:         ${{ secrets.GIST_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python main.py single "${{ github.event.inputs.topic }}" "${{ github.event.inputs.post_type }}"
 
@@ -140,17 +149,16 @@ jobs:
       - name: 📲 Handle Telegram command
         if: github.event_name == 'repository_dispatch'
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
-          IG_USER_ID: ${{ secrets.IG_USER_ID }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GIST_ID: ${{ secrets.GIST_ID }}
+          GEMINI_API_KEY:     ${{ secrets.GEMINI_API_KEY }}
+          HF_TOKEN:           ${{ secrets.HF_TOKEN }}
+          IG_ACCESS_TOKEN:    ${{ secrets.IG_ACCESS_TOKEN }}
+          IG_USER_ID:         ${{ secrets.IG_USER_ID }}
+          GITHUB_TOKEN:       ${{ secrets.GITHUB_TOKEN }}
+          GIST_ID:            ${{ secrets.GIST_ID }}
+          GIST_TOKEN:         ${{ secrets.GIST_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-          TELEGRAM_UPDATE: ${{ toJson(github.event.client_payload) }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_UPDATE:    ${{ toJson(github.event.client_payload) }}
         run: python telegram_webhook_handler.py
 
       # ── Notify on failure ─────────────────────────────────────────────────
@@ -158,13 +166,12 @@ jobs:
         if: failure()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python -c "
-          import asyncio, os, sys
+          import asyncio, sys
           sys.path.insert(0, '.')
           from core.telegram_bot import TelegramBot
           bot = TelegramBot()
-          asyncio.run(bot.send_message('❌ Project Oracle pipeline FAILED in GitHub Actions. Check: https://github.com/${{ github.repository }}/actions'))
-          " || true   # Don't fail the step if Telegram notification fails
+          asyncio.run(bot.send_message('❌ Project Oracle pipeline FAILED.\nCheck: https://github.com/${{ github.repository }}/actions'))
+          " || true

@@ -12,3 +12,11 @@ python-dotenv>=1.0.0      # Local .env file support
 
 # Type hints / data validation
 typing-extensions>=4.10.0
+
+requests>=2.31.0
+
+transformers>=4.40.0
+
+scipy>=1.11.0
+numpy>=1.26.0
+torch>=2.2.0
