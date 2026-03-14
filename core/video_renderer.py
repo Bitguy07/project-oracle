@@ -18,6 +18,7 @@ Instagram spec:
 
 import hashlib
 import logging
+import math
 import subprocess
 from pathlib import Path
 
@@ -54,8 +55,16 @@ class VideoRenderer:
             log.warning("Invalid audio — using silent fallback.")
             audio_path = self._make_silent()
 
+        # Safety: Probe duration and calculate loops if needed
+        dur = self._probe_audio_duration(audio_path)
+        extra_loops = 0
+        if dur > 0 and dur < VIDEO_DURATION:
+            total_plays = math.ceil(VIDEO_DURATION / dur)
+            extra_loops = total_plays - 1
+            log.info(f"Audio short ({dur:.1f}s); looping {extra_loops} extra times for {VIDEO_DURATION}s video.")
+
         fc = self._build_filter_complex(width, height, text_layers, video_style)
-        cmd = self._build_cmd(image_path, audio_path, output_path, fc)
+        cmd = self._build_cmd(image_path, audio_path, output_path, fc, extra_loops)
 
         log.info(f"Rendering [{video_style}]: {output_path.name}")
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -67,6 +76,21 @@ class VideoRenderer:
         size_mb = output_path.stat().st_size / (1024 * 1024)
         log.info(f"Render complete: {output_path} ({size_mb:.1f} MB)")
         return output_path
+
+    def _probe_audio_duration(self, audio_path: Path) -> float:
+        try:
+            result = subprocess.run(
+                [
+                    "ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+                    "-of", "csv=p=0", str(audio_path)
+                ],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                return float(result.stdout.strip())
+        except (ValueError, subprocess.TimeoutExpired, Exception) as e:
+            log.warning(f"Failed to probe audio duration: {e}")
+        return 0.0
 
     def _build_filter_complex(
         self, width: int, height: int, text_layers: list[dict], video_style: str
@@ -168,11 +192,16 @@ class VideoRenderer:
         audio_path: Path,
         output_path: Path,
         filter_complex: str,
+        extra_loops: int = 0,
     ) -> list[str]:
-        return [
+        cmd = [
             "ffmpeg", "-y",
             "-loop", "1", "-framerate", str(FRAMERATE), "-i", str(image_path),
-            "-stream_loop", "-1", "-i", str(audio_path),
+        ]
+        if extra_loops > 0:
+            cmd.extend(["-stream_loop", str(extra_loops)])
+        cmd.extend([
+            "-i", str(audio_path),
             "-filter_complex", filter_complex,
             "-map", "[vout]", "-map", "[aout]",
             "-c:v", "libx264", "-preset", "fast", "-crf", "22",
@@ -183,7 +212,8 @@ class VideoRenderer:
             "-t", str(VIDEO_DURATION),
             "-movflags", "+faststart",
             str(output_path),
-        ]
+        ])
+        return cmd
 
     def _is_valid_audio(self, audio_path: Path) -> bool:
         try:
